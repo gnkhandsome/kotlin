@@ -29,6 +29,8 @@ import org.jetbrains.kotlin.fir.resolve.transformers.*
 import org.jetbrains.kotlin.fir.scopes.impl.FirLocalScope
 import org.jetbrains.kotlin.fir.scopes.impl.FirMemberTypeParameterScope
 import org.jetbrains.kotlin.fir.symbols.constructStarProjectedType
+import org.jetbrains.kotlin.fir.symbols.impl.ConeClassLookupTagWithFixedSymbol
+import org.jetbrains.kotlin.fir.symbols.impl.FirAnonymousObjectSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirVariableSymbol
 import org.jetbrains.kotlin.fir.types.*
 import org.jetbrains.kotlin.fir.types.builder.buildErrorTypeRef
@@ -497,7 +499,7 @@ open class FirDeclarationsResolveTransformer(transformer: FirBodyResolveTransfor
         val body = result.body
         if (result.returnTypeRef is FirImplicitTypeRef) {
             if (body != null) {
-                result.transformReturnTypeRef(transformer, withExpectedType(body.resultType))
+                result.transformReturnTypeRef(transformer, withExpectedType(body.resultType.unwrapAnonymousObjectSupertypeIfNeeded()))
             } else {
                 result.transformReturnTypeRef(
                     transformer,
@@ -507,6 +509,44 @@ open class FirDeclarationsResolveTransformer(transformer: FirBodyResolveTransfor
         }
 
         return result.compose()
+    }
+
+    /*
+     * Suppose a function without an explicit return type just returns an anonymous object:
+     *
+     *   fun foo(...) = object : ObjectSuperType {
+     *     override fun ...
+     *   }
+     *
+     * Without unwrapping, the return type ended up with that anonymous object (<no name provided>), while the resolved super type, which
+     * acts like an implementing interface, is a better fit.
+     */
+    private fun FirTypeRef.unwrapAnonymousObjectSupertypeIfNeeded(): FirTypeRef {
+        val anonymousObject =
+            ((((this as? FirResolvedTypeRef)
+                ?.type as? ConeClassLikeType)
+                ?.lookupTag as? ConeClassLookupTagWithFixedSymbol)
+                ?.symbol as? FirAnonymousObjectSymbol)?.fir
+                ?: return this
+        // TODO: replace this ad-hoc condition with a better handling
+        //   Conflict: diagnostic test properties.inferenceFromGetters.objectExpression
+        //     has a property whose getter returns an anonymous object with own members, which are later invoked.
+        //     If we unwrap the type here, those member accesses become unresolved calls.
+        //   Conflict: bb test coroutines.javaInterop.objectWithSeveralSuspends
+        //     has an inline function that returns an anonymous object with own members (inline suspend, if that matters).
+        //     If we unwrap the type here, that test is working as well.
+        val hasItsOwnMember =
+            anonymousObject.declarations.any {
+                (it as? FirSimpleFunction)?.isOverride == false || (it as? FirProperty)?.isOverride == false
+            }
+        if (hasItsOwnMember) {
+            return this
+        }
+        val anonymousObjectSupertype = anonymousObject.superTypeRefs.singleOrNull()
+        if (anonymousObjectSupertype is FirResolvedTypeRef && !anonymousObjectSupertype.isAny) {
+            return anonymousObjectSupertype
+        }
+        return this
     }
 
     override fun <F : FirFunction<F>> transformFunction(
